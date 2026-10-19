@@ -122,6 +122,7 @@ fn attest_invoice(te: &TestEnv, invoice_id: &BytesN<32>) {
         evidence_hash: BytesN::from_array(&te.env, &[9u8; 32]),
         agent_id: test_agent_id(&te.env),
         nonce: 1,
+        expires_at: te.env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(&te.env);
     let digest = te.env.crypto().keccak256(&payload_bytes).to_array();
@@ -3795,6 +3796,7 @@ mod real_registry_integration {
             evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
             agent_id: test_agent_id(&env),
             nonce: 1,
+            expires_at: env.ledger().timestamp() + 3_600,
         };
         let payload_bytes = payload.to_xdr(&env);
         let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -3863,6 +3865,7 @@ mod real_registry_integration {
             evidence_hash: BytesN::from_array(&env, &[8u8; 32]),
             agent_id: test_agent_id(&env),
             nonce: 2,
+            expires_at: env.ledger().timestamp() + 3_600,
         };
         let second_payload_bytes = second_payload.to_xdr(&env);
         let second_digest = env.crypto().keccak256(&second_payload_bytes).to_array();
@@ -4726,6 +4729,68 @@ fn prop_protocol_fee_split_conserves_yield_for_all_fee_bps() {
                     prop_assert_eq!(deposits_delta, yield_amount);
                 }
 
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn prop_settlement_conserves_funded_capital_yield_fees_and_lp_shares() {
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(10));
+    runner
+        .run(
+            &(
+                2u128..=DEFAULT_FACE_VALUE,
+                1u32..=5_000u32,
+                0u32..=MAX_PROTOCOL_FEE_BPS,
+            ),
+            |(face_value, discount_bps, fee_bps)| {
+                let te = setup();
+                let initial_deposit = 100_000_000_000u128;
+                let shares = te.pool.deposit(&te.lp, &initial_deposit);
+                let invoice_id = create_and_list_with_params(
+                    &te,
+                    &te.usdc_id,
+                    face_value,
+                    discount_bps,
+                );
+                let funded_amount = face_value * (10_000 - discount_bps as u128) / 10_000;
+                let yield_amount = face_value - funded_amount;
+                te.pool.fund_invoice(&invoice_id);
+
+                let treasury = Address::generate(&te.env);
+                te.pool.set_protocol_fee(&fee_bps, &treasury);
+                let token = MockTokenClient::new(&te.env, &te.usdc_id);
+                let treasury_before = token.balance(&treasury);
+                let before = te.pool.get_stats();
+                let shares_before = te.pool.get_lp_position(&te.lp).shares;
+
+                prop_assert_eq!(before.total_funded, funded_amount);
+                prop_assert_eq!(shares_before, shares);
+                prop_assert!(te.pool.receive_repayment(&invoice_id, &face_value));
+
+                let protocol_cut = yield_amount * fee_bps as u128 / 10_000;
+                let lp_yield = yield_amount - protocol_cut;
+                let after = te.pool.get_stats();
+                let position = te.pool.get_lp_position(&te.lp);
+
+                prop_assert_eq!(after.total_funded, 0);
+                prop_assert_eq!(after.total_deposits, before.total_deposits + lp_yield);
+                prop_assert_eq!(
+                    after.total_yield_distributed - before.total_yield_distributed,
+                    lp_yield
+                );
+                prop_assert_eq!(
+                    token.balance(&treasury) - treasury_before,
+                    protocol_cut as i128
+                );
+                prop_assert_eq!(after.total_shares, before.total_shares);
+                prop_assert_eq!(position.shares, shares_before);
+                prop_assert_eq!(
+                    position.usdc_value,
+                    position.shares * after.total_deposits / after.total_shares
+                );
                 Ok(())
             },
         )

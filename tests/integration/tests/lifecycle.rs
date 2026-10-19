@@ -2,7 +2,7 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, testutils::Ledger as _,
-    xdr::ToXdr, Address, BytesN, Env, Map, String, Symbol,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Symbol,
 };
 
 use clearledger_escrow::{EscrowContract, EscrowContractClient};
@@ -152,6 +152,128 @@ fn create_fee_lifecycle_invoice(lifecycle: &FeeLifecycle) -> (BytesN<32>, u64) {
     (invoice_id, due_date)
 }
 
+fn create_attestation_invoice(lifecycle: &FeeLifecycle) -> BytesN<32> {
+    lifecycle.invoice.create(
+        &lifecycle.issuer,
+        &lifecycle.buyer,
+        &1_000_000_000,
+        &(lifecycle.env.ledger().timestamp() + 30 * 86400),
+        &lifecycle.usdc_id,
+    )
+}
+
+#[test]
+fn test_configured_agent_registry_attestation_signature_matrix() {
+    let lifecycle = setup_fee_lifecycle();
+    let now = lifecycle.env.ledger().timestamp();
+    let domain = BytesN::from_array(
+        &lifecycle.env,
+        &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
+    );
+    let agent_id = test_agent_id(&lifecycle.env);
+
+    let valid_id = create_attestation_invoice(&lifecycle);
+    let (payload, signature) = signed_attestation(
+        &lifecycle.env,
+        &valid_id,
+        agent_id.clone(),
+        domain.clone(),
+        now + 3_600,
+        1,
+    );
+    lifecycle
+        .invoice
+        .submit_attestation(&valid_id, &payload, &signature);
+    assert!(lifecycle.invoice.get_attestation(&valid_id).is_some());
+    assert!(lifecycle.invoice.list_for_financing(&valid_id, &200));
+    assert!(lifecycle
+        .invoice
+        .try_submit_attestation(&valid_id, &payload, &signature)
+        .is_err());
+
+    let listing_expiry_id = create_attestation_invoice(&lifecycle);
+    let (payload, signature) = signed_attestation(
+        &lifecycle.env,
+        &listing_expiry_id,
+        agent_id.clone(),
+        domain.clone(),
+        now + 1,
+        2,
+    );
+    lifecycle
+        .invoice
+        .submit_attestation(&listing_expiry_id, &payload, &signature);
+    lifecycle.env.ledger().set_timestamp(now + 2);
+    assert!(lifecycle
+        .invoice
+        .try_list_for_financing(&listing_expiry_id, &200)
+        .is_err());
+
+    let expired_id = create_attestation_invoice(&lifecycle);
+    let (payload, signature) = signed_attestation(
+        &lifecycle.env,
+        &expired_id,
+        agent_id.clone(),
+        domain.clone(),
+        now + 2,
+        3,
+    );
+    assert!(lifecycle
+        .invoice
+        .try_submit_attestation(&expired_id, &payload, &signature)
+        .is_err());
+
+    let wrong_domain_id = create_attestation_invoice(&lifecycle);
+    let (payload, signature) = signed_attestation(
+        &lifecycle.env,
+        &wrong_domain_id,
+        agent_id.clone(),
+        BytesN::from_array(&lifecycle.env, &[8u8; 32]),
+        now + 3_600,
+        4,
+    );
+    assert!(lifecycle
+        .invoice
+        .try_submit_attestation(&wrong_domain_id, &payload, &signature)
+        .is_err());
+
+    let unknown_id = create_attestation_invoice(&lifecycle);
+    let (payload, signature) = signed_attestation(
+        &lifecycle.env,
+        &unknown_id,
+        Symbol::new(&lifecycle.env, "unknown_agent"),
+        domain.clone(),
+        now + 3_600,
+        5,
+    );
+    assert!(lifecycle
+        .invoice
+        .try_submit_attestation(&unknown_id, &payload, &signature)
+        .is_err());
+
+    let revoked_id = create_attestation_invoice(&lifecycle);
+    let registry_id = lifecycle.invoice.get_agent_registry_contract().unwrap();
+    MockAgentRegistryClient::new(&lifecycle.env, &registry_id).register_agent(
+        &agent_id,
+        &clearledger_invoice::Agent {
+            active: false,
+            pubkey: test_agent_pubkey(&lifecycle.env),
+        },
+    );
+    let (payload, signature) = signed_attestation(
+        &lifecycle.env,
+        &revoked_id,
+        agent_id,
+        domain,
+        now + 3_600,
+        6,
+    );
+    assert!(lifecycle
+        .invoice
+        .try_submit_attestation(&revoked_id, &payload, &signature)
+        .is_err());
+}
+
 struct FeeSettlementExpectation {
     shares: u128,
     deposit: u128,
@@ -242,16 +364,33 @@ fn test_agent_id(env: &Env) -> Symbol {
 }
 
 fn attest_invoice(env: &Env, invoice_client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
+    let (payload_bytes, signature) = signed_attestation(
+        env,
+        invoice_id,
+        test_agent_id(env),
+        BytesN::from_array(env, &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR),
+        env.ledger().timestamp() + 3_600,
+        1,
+    );
+    invoice_client.submit_attestation(invoice_id, &payload_bytes, &signature);
+}
+
+fn signed_attestation(
+    env: &Env,
+    invoice_id: &BytesN<32>,
+    agent_id: Symbol,
+    domain_separator: BytesN<32>,
+    expires_at: u64,
+    nonce: u64,
+) -> (Bytes, BytesN<65>) {
     let payload = clearledger_invoice::AttestationPayload {
-        domain_separator: BytesN::from_array(
-            env,
-            &clearledger_invoice::ATTESTATION_DOMAIN_SEPARATOR,
-        ),
+        domain_separator,
         invoice_id: invoice_id.clone(),
         risk_score: 5000,
         evidence_hash: BytesN::from_array(env, &[9u8; 32]),
-        agent_id: test_agent_id(env),
-        nonce: 1,
+        agent_id,
+        nonce,
+        expires_at,
     };
     let payload_bytes = payload.to_xdr(env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();
@@ -262,8 +401,7 @@ fn attest_invoice(env: &Env, invoice_client: &InvoiceContractClient, invoice_id:
     sig_bytes[..64].copy_from_slice(&sig.to_bytes());
     sig_bytes[64] = recid.to_byte();
     let signature = BytesN::from_array(env, &sig_bytes);
-
-    invoice_client.submit_attestation(invoice_id, &payload_bytes, &signature);
+    (payload_bytes, signature)
 }
 
 // --------------- Cross-Contract Integration Tests (Issue #313) ---------------

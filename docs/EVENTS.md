@@ -6,6 +6,14 @@ All amounts are in **USDC stroops** (1 USDC = 10,000,000 stroops).
 All timestamps are **Unix seconds** (u64).  
 Invoice IDs are **BytesN<32>** (32-byte identifiers).
 
+Events are public ledger data. Addresses, amounts, identifiers, and any other
+published fields are visible to network observers; downstream indexers may
+retain them independently of contract-storage TTL. Do not place confidential
+information in event fields. An event records the contract call's reported
+state change, not a guarantee of financing, repayment, or returns. See the
+[caller-controlled storage audit](STORAGE.md#caller-controlled-persistent-data-audit)
+for storage retention, bounds, and trust boundaries.
+
 ---
 
 ## Invoice Contract

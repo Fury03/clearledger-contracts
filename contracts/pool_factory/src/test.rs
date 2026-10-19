@@ -709,6 +709,7 @@ fn attest_invoice(env: &Env, invoice: &InvoiceContractClient, invoice_id: &Bytes
         evidence_hash: BytesN::from_array(env, &[9; 32]),
         agent_id,
         nonce: 1,
+        expires_at: env.ledger().timestamp() + 3_600,
     };
     let payload_bytes = payload.to_xdr(env);
     let digest = env.crypto().keccak256(&payload_bytes).to_array();

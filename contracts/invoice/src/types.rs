@@ -119,6 +119,9 @@ pub enum DataKey {
     // idempotency checks (issues #831 / #835). Appended after every existing
     // variant so already-deployed key discriminants stay stable.
     StatusMembership(InvoiceStatus, u64),
+    /// Expiration timestamp from the signed attestation payload. Appended to
+    /// preserve the discriminants of existing persistent storage keys.
+    AttestationExpiry(BytesN<32>),
 }
 
 /// A risk attestation recorded against an invoice by a registered
@@ -133,7 +136,8 @@ pub struct Attestation {
     /// Identifier of the attesting agent, as registered in the
     /// agent-registry contract.
     pub agent_id: Symbol,
-    /// Risk score in basis points (0-10000). Never a float — same
+    /// Risk score represented as a `u32` in basis points. The contract does
+    /// not currently enforce a semantic range. Never a float — same
     /// fixed-point convention as [`Invoice::discount_bps`].
     pub risk_score: u32,
     /// Hash of the off-chain evidence backing this attestation (e.g. the
@@ -166,6 +170,9 @@ pub struct AttestationPayload {
     /// Caller-chosen nonce. Not separately tracked on-chain: the
     /// one-attestation-per-invoice storage check is the replay guard.
     pub nonce: u64,
+    /// Unix timestamp (seconds) after which this signed attestation may not
+    /// be submitted or used to list the invoice.
+    pub expires_at: u64,
 }
 
 /// Local mirror of the `Agent` record exposed by the agent-registry

@@ -50,6 +50,34 @@ All contracts follow a consistent TTL extension pattern:
 > immediately followed by `persistent().extend_ttl()`. The `extend_instance_ttl()`
 > helper is called at the end of every public state-changing function.
 
+## Caller-Controlled Persistent Data Audit
+
+Persistent values and contract events are public ledger data. TTL limits how
+long a value remains live; it does not make the value private, and a hash does
+not conceal a low-entropy secret. Do not submit personal data, credentials,
+private reports, or other confidential material in metadata, addresses,
+symbols, event fields, or signed payloads. Attestations store the evidence hash,
+not the off-chain evidence itself.
+
+| Contract / key family | Caller-controlled data and bounds | Retention / growth | Privacy and trust boundary |
+|---|---|---|---|
+| Registry `Profile(Address)` | Address is a fixed Soroban `Address`. Metadata accepts at most 20 entries; each non-empty key is at most 64 bytes and each non-empty value at most 512 bytes. | Persistent profile TTL is extended on registration and update. Profile and role-index cardinality has no protocol-wide cap; batch registration is limited to 50 entries per call. | A profile owner signs self-registration and metadata updates; admin batch registration is trusted. Profile values and addresses are public. |
+| Registry `ProfileIndex` / `ProfileCount` | Fixed-width role, `u32` index/count, and address values. | Append-only; no deregistration or index compaction. Unique profile count can grow without a global limit. | Public enumeration exposes registered addresses and their registration order. |
+| Invoice `Invoice`, indexes, `Attestation`, `AttestationExpiry` | Invoice IDs/evidence hashes are `BytesN<32>`, addresses are fixed Soroban `Address`, and scalar fields are fixed-width. Creation caps face value at `MAX_FACE_VALUE` and due date at 10 years. Attestation `agent_id` is a bounded `Symbol`; `risk_score` is `u32` with no semantic range check; nonce/expiry are `u64`. Raw XDR payload must decode but has no application-specific encoded-length cap and is not stored. | Invoice, index, attestation, and expiry entries receive persistent TTL extensions when written. Index entries are bounded per invoice but aggregate invoice count has no global cap. | Issuer/buyer authorize invoice actions; attestation trust is the signature plus active agent registry record. Stored scores, identifiers, and evidence hashes are public. Signed payload wire format includes `expires_at`; see [invoice lifecycle](../contracts/invoice/STATE_TRANSITIONS.md). |
+| Pool LP positions and `Allowance(Address, Address)` | Address keys and numeric share/deposit/yield values are fixed-width. Allowances reject negative amounts, expire by ledger sequence, and amount zero removes the key. | Position keys are per address; allowance keys are per address pair. No global address-count cap. Non-zero writes extend TTL; expired grants read as zero. | LP authorizes share changes and grants; spender authorizes `transfer_from`. Balances, counterparties, and amounts are public. |
+| Pool `FundedInvoice(BytesN<32>)` | Invoice ID key with a fixed-width `u128` funded amount, populated from verified invoice terms. | Persistent TTL is extended when funding is recorded; the entry is removed when settled/defaulted. Number of funded invoice IDs has no global cap beyond pool liquidity and network resources. | Pool controls writes after reading invoice/registry state. Invoice ID and funded amount are public. |
+| Pool instance configuration | Admin supplies treasury address, minimum deposit, share name/symbol and decimals at initialization; name/symbol must be non-empty but have no application-level length cap, and decimals are any `u32`. Protocol fee is admin-set and capped by `MAX_PROTOCOL_FEE_BPS`. | Stored in instance storage and covered by instance TTL extension. | Admin is the trust boundary; configuration and share metadata are public. |
+| Escrow `Locked(BytesN<32>)` | Fixed-width invoice ID, amount, timestamps, and issuer address. | One active lock per invoice; removed on release/default. Persistent TTL is extended on write. | Only the configured pool can lock/release; authorized release paths determine the recipient. Amounts and parties are public. |
+| Escrow `History(BytesN<32>)` | Append-only `Vec<EscrowEvent>` containing fixed-width invoice ID, action, amount, timestamp, and optional caller address. | Each action appends and extends TTL. There is no application-level vector-length cap or compaction; storage/resource limits are the effective bound. | Only escrow-authorized flows append, but history and caller addresses are public. Never treat it as a private audit channel. |
+
+All caller-provided byte/string inputs are also subject to Soroban transaction and
+resource limits. Those network limits are not a substitute for application
+validation: registry metadata caps are explicit, while escrow history and the
+encoded attestation payload have no application-level length cap, and attestation
+scores have no semantic range check. This audit describes the
+contract behavior in this checkout; deployment TTL settings and archival
+policies remain network configuration.
+
 ---
 
 ## Contract: registry_contract

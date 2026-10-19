@@ -912,6 +912,8 @@ impl InvoiceContract {
     /// * `InvoiceError::NotFound` if the invoice does not exist.
     /// * `InvoiceError::VerificationRequired` if no Underwrite agent attestation has
     ///   been submitted for this invoice (see `submit_attestation`).
+    /// * `InvoiceError::AttestationExpired` if the submitted attestation has
+    ///   expired before listing.
     /// * `InvoiceError::InvalidStatusTransition` if invoice status is not `Created`.
     /// * `InvoiceError::IssuerNotVerified` if the issuer's registry verification
     ///   has since been revoked.
@@ -940,6 +942,9 @@ impl InvoiceContract {
             .has(&DataKey::Attestation(invoice_id.clone()))
         {
             panic_with_error!(&env, InvoiceError::VerificationRequired);
+        }
+        if Self::attestation_expired(&env, &invoice_id) {
+            panic_with_error!(&env, InvoiceError::AttestationExpired);
         }
         invoice.issuer.require_auth();
         if invoice.status != InvoiceStatus::Created {
@@ -1093,6 +1098,9 @@ impl InvoiceContract {
         {
             return false;
         }
+        if Self::attestation_expired(env, invoice_id) {
+            return false;
+        }
         if !authorized.contains(&invoice.issuer) {
             invoice.issuer.require_auth();
             authorized.push_back(invoice.issuer.clone());
@@ -1134,6 +1142,14 @@ impl InvoiceContract {
         verified
     }
 
+    fn attestation_expired(env: &Env, invoice_id: &BytesN<32>) -> bool {
+        // Legacy attestations have no expiry key and retain their prior behavior.
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::AttestationExpiry(invoice_id.clone()))
+            .is_some_and(|expires_at| env.ledger().timestamp() >= expires_at)
+    }
+
     /// Cancels an invoice while it is still in `Created` status.
     pub fn cancel(env: Env, invoice_id: BytesN<32>) -> bool {
         let inv_key = DataKey::Invoice(invoice_id.clone());
@@ -1173,8 +1189,8 @@ impl InvoiceContract {
     /// * `env` - The Soroban environment.
     /// * `invoice_id` - The invoice being attested.
     /// * `payload` - XDR-encoded [`AttestationPayload`]: `domain_separator`,
-    ///   `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`.
-    ///   This is exactly the byte string the agent signed.
+    ///   `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`, `nonce`, and
+    ///   `expires_at`. This is exactly the byte string the agent signed.
     /// * `signature` - A 65-byte recoverable secp256k1 signature over
     ///   `keccak256(payload)`: 64 bytes of `r || s` followed by a 1-byte
     ///   recovery id.
@@ -1192,6 +1208,8 @@ impl InvoiceContract {
     ///   `AttestationPayload`, if its `domain_separator` doesn't match this
     ///   contract's, or if its `invoice_id` doesn't match the `invoice_id`
     ///   argument.
+    /// * `InvoiceError::AttestationExpired` if `expires_at` is not strictly
+    ///   later than the current ledger timestamp.
     /// * `InvoiceError::UntrustedSigner` if the recovered signer is not an
     ///   active agent in the agent-registry, or its registered pubkey
     ///   doesn't match the recovered key.
@@ -1229,6 +1247,9 @@ impl InvoiceContract {
         }
         if decoded.invoice_id != invoice_id {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
+        }
+        if decoded.expires_at <= env.ledger().timestamp() {
+            panic_with_error!(&env, InvoiceError::AttestationExpired);
         }
 
         // Split the 65-byte recoverable signature into its 64-byte r||s
@@ -1268,6 +1289,13 @@ impl InvoiceContract {
         env.storage()
             .persistent()
             .extend_ttl(&attestation_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        let expiry_key = DataKey::AttestationExpiry(invoice_id.clone());
+        env.storage()
+            .persistent()
+            .set(&expiry_key, &decoded.expires_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&expiry_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         Self::extend_instance_ttl(&env);
 
         events::attestation_submitted(&env, &invoice_id, &decoded.agent_id, decoded.risk_score);
