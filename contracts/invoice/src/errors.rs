@@ -39,4 +39,14 @@ pub enum InvoiceError {
     BatchSizeExceeded = 28,
     /// The signed attestation is expired or has expired before listing.
     AttestationExpired = 29,
+    // Discriminant 30 is reserved for issue #83.
+    /// `get_funded_amount` was called for an invoice that exists but has not
+    /// been funded yet. The committed amount is only meaningful once
+    /// `mark_funded` has recorded it, so callers get a distinct error instead
+    /// of a `0` that is indistinguishable from a real commitment.
+    NotFunded = 31,
+    /// Funding was attempted at or after the listing's expiry deadline.
+    /// Expiry is time-based, so it takes effect even if `expire_listing` has
+    /// not been called yet in this ledger.
+    ListingExpired = 32,
 }
