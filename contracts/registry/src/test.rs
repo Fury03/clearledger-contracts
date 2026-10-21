@@ -3,8 +3,8 @@
 extern crate std;
 
 use crate::{
-    DataKey, Profile, RegistryContract, RegistryContractClient, RegistryError, RevocationReason, Role,
-    VerificationStatus, TTL_EXTEND_TO, TTL_THRESHOLD,
+    DataKey, Profile, RegistryContract, RegistryContractClient, RegistryError, RevocationReason,
+    Role, VerificationStatus, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
@@ -331,19 +331,31 @@ fn test_reinstate_restores_verified_and_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone(), Role::Issuer)
+                (
+                    Symbol::new(&env, "profile_verified"),
+                    issuer.clone(),
+                    Role::Issuer
+                )
                     .into_val(&env),
                 true.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer)
+                (
+                    Symbol::new(&env, "address_revoked"),
+                    issuer.clone(),
+                    Role::Issuer
+                )
                     .into_val(&env),
                 RevocationReason::Unspecified.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_reinstated"), issuer.clone(), Role::Issuer)
+                (
+                    Symbol::new(&env, "address_reinstated"),
+                    issuer.clone(),
+                    Role::Issuer
+                )
                     .into_val(&env),
                 ().into_val(&env),
             ),
@@ -1212,13 +1224,7 @@ fn test_revoke_and_reinstate_events_include_buyer_role() {
     assert_last_event_role(&env, &client, "address_revoked", &buyer, Role::Buyer);
 
     client.reinstate(&buyer);
-    assert_last_event_role(
-        &env,
-        &client,
-        "address_reinstated",
-        &buyer,
-        Role::Buyer,
-    );
+    assert_last_event_role(&env, &client, "address_reinstated", &buyer, Role::Buyer);
 }
 
 #[test]
@@ -1476,6 +1482,26 @@ fn test_registry_transfer_ownership_requires_both_auths() {
     client.initialize(&admin);
     env.set_auths(&[]);
     client.transfer_ownership(&new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_transfer_ownership_rejects_contract_self_with_typed_error() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let contract_address = client.address.clone();
+    client.transfer_ownership(&contract_address);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_transfer_admin_rejects_contract_self_with_typed_error() {
+    let (env, client) = setup();
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let contract_address = client.address.clone();
+    client.transfer_admin(&contract_address);
 }
 
 // ============== PROPERTY-BASED INVARIANT TESTS ==============
@@ -1959,13 +1985,21 @@ fn test_revoke_emits_event() {
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "profile_verified"), issuer.clone(), Role::Issuer)
+                (
+                    Symbol::new(&env, "profile_verified"),
+                    issuer.clone(),
+                    Role::Issuer
+                )
                     .into_val(&env),
                 true.into_val(&env),
             ),
             (
                 client.address.clone(),
-                (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer)
+                (
+                    Symbol::new(&env, "address_revoked"),
+                    issuer.clone(),
+                    Role::Issuer
+                )
                     .into_val(&env),
                 RevocationReason::Unspecified.into_val(&env),
             ),
@@ -1989,7 +2023,12 @@ fn test_revoke_with_reason_emits_explicit_reason_code() {
     let event = events.last().unwrap();
     assert_eq!(
         event.1,
-        (Symbol::new(&env, "address_revoked"), issuer.clone(), Role::Issuer).into_val(&env)
+        (
+            Symbol::new(&env, "address_revoked"),
+            issuer.clone(),
+            Role::Issuer
+        )
+            .into_val(&env)
     );
     let emitted: u32 = u32::try_from_val(&env, &event.2).unwrap();
     assert_eq!(emitted, RevocationReason::Fraud as u32);
@@ -2804,7 +2843,10 @@ fn assert_duplicate_register_rejected(
     } else {
         client.try_register_issuer(address, &map![env])
     };
-    assert_eq!(result.unwrap_err(), contract_error(RegistryError::AlreadyRegistered as u32));
+    assert_eq!(
+        result.unwrap_err(),
+        contract_error(RegistryError::AlreadyRegistered as u32)
+    );
 }
 
 fn assert_enumeration_matches(
@@ -2860,10 +2902,7 @@ fn run_enumeration_prop_test(is_buyer: bool) {
                             let address = addresses[a].clone();
                             if registered[a] {
                                 assert_duplicate_register_rejected(
-                                    &env,
-                                    &client,
-                                    is_buyer,
-                                    &address,
+                                    &env, &client, is_buyer, &address,
                                 );
                             } else {
                                 register_for_role(&env, &client, is_buyer, &address);
@@ -2947,14 +2986,18 @@ fn run_enumeration_prop_test(is_buyer: bool) {
 
                 assert_eq!(client.list_profiles(&role, &0, &0).len(), 0);
                 assert_eq!(
-                    client.list_profiles(&role, &(expected.len() as u32 + 1), &25).len(),
+                    client
+                        .list_profiles(&role, &(expected.len() as u32 + 1), &25)
+                        .len(),
                     0
                 );
                 assert_eq!(client.list_profiles(&role, &u32::MAX, &50).len(), 0);
 
                 for invalid_limit in [51u32, 100, u32::MAX] {
                     assert_eq!(
-                        client.try_list_profiles(&role, &0, &invalid_limit).unwrap_err(),
+                        client
+                            .try_list_profiles(&role, &0, &invalid_limit)
+                            .unwrap_err(),
                         contract_error(RegistryError::PageSizeExceeded as u32)
                     );
                 }
@@ -3281,7 +3324,11 @@ fn test_batch_register_issuers_non_admin_rejected_and_state_unchanged() {
     client.initialize(&Address::generate(&env));
     let first = Address::generate(&env);
     let second = Address::generate(&env);
-    let entries = vec![&env, (first.clone(), map![&env]), (second.clone(), map![&env])];
+    let entries = vec![
+        &env,
+        (first.clone(), map![&env]),
+        (second.clone(), map![&env]),
+    ];
 
     let non_admin = Address::generate(&env);
     mock_single_auth(
@@ -3310,7 +3357,11 @@ fn test_batch_register_buyers_non_admin_rejected_and_state_unchanged() {
     client.initialize(&Address::generate(&env));
     let first = Address::generate(&env);
     let second = Address::generate(&env);
-    let entries = vec![&env, (first.clone(), map![&env]), (second.clone(), map![&env])];
+    let entries = vec![
+        &env,
+        (first.clone(), map![&env]),
+        (second.clone(), map![&env]),
+    ];
 
     let non_admin = Address::generate(&env);
     mock_single_auth(

@@ -101,10 +101,14 @@ impl PoolContract {
     ///
     /// # Panics
     /// * `AlreadyInitialized` if the contract has already been initialized.
-    /// * `InvalidConfiguration` if core contract addresses collide, if
-    ///   `treasury` equals the pool itself or any settlement contract address,
-    ///   or if `share_name`/`share_symbol` is empty (a wallet that cannot render
-    ///   the share token is treated as a misconfigured deploy).
+    /// * `InvalidContractAddress` if core contract addresses collide.
+    /// * `InvalidAsset` if `funding_asset` aliases `admin` or another wired
+    ///   contract role.
+    /// * `InvalidTreasury` if `treasury` equals the pool itself or any
+    ///   settlement contract address.
+    /// * `InvalidShareMetadata` if `share_name` or `share_symbol` is empty
+    ///   (a wallet that cannot render the share token is treated as a
+    ///   misconfigured deploy).
     /// * `EscrowAssetMismatch` if `escrow_contract`'s configured USDC asset
     ///   does not match `funding_asset`.
     ///
@@ -139,21 +143,24 @@ impl PoolContract {
         if Self::admin(&env).is_some() {
             panic_with_error!(&env, PoolError::AlreadyInitialized);
         }
-        if admin == invoice_contract
-            || admin == escrow_contract
-            || admin == funding_asset
-            || admin == registry_contract
-            || invoice_contract == escrow_contract
-            || invoice_contract == funding_asset
-            || invoice_contract == registry_contract
-            || escrow_contract == funding_asset
-            || escrow_contract == registry_contract
+        if funding_asset == admin
+            || funding_asset == invoice_contract
+            || funding_asset == escrow_contract
             || funding_asset == registry_contract
         {
-            panic_with_error!(&env, PoolError::InvalidConfiguration);
+            panic_with_error!(&env, PoolError::InvalidAsset);
+        }
+        if admin == invoice_contract
+            || admin == escrow_contract
+            || admin == registry_contract
+            || invoice_contract == escrow_contract
+            || invoice_contract == registry_contract
+            || escrow_contract == registry_contract
+        {
+            panic_with_error!(&env, PoolError::InvalidContractAddress);
         }
         if share_name.is_empty() || share_symbol.is_empty() {
-            panic_with_error!(&env, PoolError::InvalidConfiguration);
+            panic_with_error!(&env, PoolError::InvalidShareMetadata);
         }
         Self::assert_valid_treasury(
             &env,
@@ -570,7 +577,14 @@ impl PoolContract {
     /// * `MinimumDeposit` if the deposit is too small to mint at least 1 share
     ///   at the current share price (prevents 0-share dust deposits).
     /// * `Overflow` if `usdc_amount * total_shares` would overflow `u128`
-    ///   while computing the proportional share price.
+    ///   while computing the proportional share price, or if `usdc_amount`
+    ///   exceeds the funding asset's `i128` transfer range.
+    ///
+    /// # Token failure
+    /// The funding asset's `transfer` runs before any share or total write. If
+    /// the SAC call fails, the whole invocation reverts: no shares are minted
+    /// and pool totals stay unchanged. The pool does not read token balances,
+    /// so a malformed `balance()` response is never part of its accounting.
     ///
     /// # Returns
     /// * `u128` - The number of shares issued.
@@ -588,7 +602,11 @@ impl PoolContract {
 
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
-        usdc.transfer(&lp, &env.current_contract_address(), &(usdc_amount as i128));
+        usdc.transfer(
+            &lp,
+            &env.current_contract_address(),
+            &Self::token_amount(&env, usdc_amount),
+        );
 
         Self::_mint(&env, &lp, shares_to_issue);
         env.storage()
@@ -777,7 +795,7 @@ impl PoolContract {
         usdc.transfer(
             &env.current_contract_address(),
             &lp,
-            &(usdc_to_return as i128),
+            &Self::token_amount(&env, usdc_to_return),
         );
 
         let remaining_shares = Self::_burn(&env, &lp, shares);
@@ -1201,8 +1219,17 @@ impl PoolContract {
     /// * `InvalidAmount` if the computed funded amount is zero.
     /// * `InsufficientLiquidity` if the pool does not have enough funds.
     /// * `UtilizationCapExceeded` if funding would push utilization above the cap.
-    /// * `Overflow` if `face_value * (10000 - discount_bps)` or the resulting
-    ///   utilization calculation overflows `u128`.
+    /// * `Overflow` if `face_value * (10000 - discount_bps)`, the resulting
+    ///   utilization calculation, or the funded amount's conversion to the
+    ///   funding asset's `i128` transfer range overflows `u128`.
+    ///
+    /// # Token failure
+    /// Pool accounting is written before the escrow/invoice interactions
+    /// (checks-effects-interactions), but Soroban reverts the whole invocation
+    /// if `escrow::lock`'s SAC transfer fails. The `FundedInvoice` entry,
+    /// counters, and invoice status therefore roll back together; a failed
+    /// call can simply be retried and a successful one still hits
+    /// `AlreadyFunded` on replay.
     ///
     /// # Returns
     /// * `bool` - `true` when the invoice is funded.
@@ -1232,8 +1259,7 @@ impl PoolContract {
             if stop_on_capacity
                 && matches!(
                     evaluation.status,
-                    FundingStatus::InsufficientLiquidity
-                        | FundingStatus::UtilizationCapExceeded
+                    FundingStatus::InsufficientLiquidity | FundingStatus::UtilizationCapExceeded
                 )
             {
                 return false;
@@ -1259,14 +1285,14 @@ impl PoolContract {
             .clone()
             .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
 
-
         // --- Checks-effects-interactions: commit pool state BEFORE any
         // cross-contract calls so a reentrant callback into this contract
         // always sees the updated TotalFunded / ActiveInvoiceCount /
         // FundedInvoice, preventing double-funding via stale state.
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalFunded, &(evaluation.total_funded + funded_amount));
+        env.storage().instance().set(
+            &DataKey::TotalFunded,
+            &(evaluation.total_funded + funded_amount),
+        );
         env.storage().instance().set(
             &DataKey::ActiveInvoiceCount,
             &(evaluation.active_invoices + 1),
@@ -1425,17 +1451,14 @@ impl PoolContract {
         }
 
         let new_total_funded = total_funded + funded_amount;
-        let utilization_after = match Self::utilization_bps_checked(
-            env,
-            new_total_funded,
-            total_deposits,
-        ) {
-            Ok(utilization) => utilization,
-            Err(_) => {
-                evaluation.status = FundingStatus::Overflow;
-                return evaluation;
-            }
-        };
+        let utilization_after =
+            match Self::utilization_bps_checked(env, new_total_funded, total_deposits) {
+                Ok(utilization) => utilization,
+                Err(_) => {
+                    evaluation.status = FundingStatus::Overflow;
+                    return evaluation;
+                }
+            };
         evaluation.utilization_bps_after = utilization_after;
         if utilization_after > totals.max_utilization_bps {
             evaluation.status = FundingStatus::UtilizationCapExceeded;
@@ -1703,7 +1726,11 @@ impl PoolContract {
         let usdc_id = Self::funding_asset(&env);
         let usdc = token::Client::new(&env, &usdc_id);
         if refund > 0 {
-            usdc.transfer(&env.current_contract_address(), &buyer, &(refund as i128));
+            usdc.transfer(
+                &env.current_contract_address(),
+                &buyer,
+                &Self::token_amount(&env, refund),
+            );
         }
 
         true
@@ -2137,6 +2164,8 @@ impl PoolContract {
     /// Requires authorization from `admin` (via `admin.require_auth()`).
     ///
     /// # Panics
+    /// * `InvalidUtilizationCap` if `new_cap_bps` exceeds `10_000` bps
+    ///   (100%). The cap is validated before any storage write.
     /// * `InvalidConfiguration` if `new_cap_bps` is zero. A zero cap would
     ///   make every positive funding attempt fail and is therefore not a
     ///   valid operating configuration.
@@ -2156,7 +2185,7 @@ impl PoolContract {
             panic_with_error!(&env, PoolError::InvalidConfiguration);
         }
         if new_cap_bps > 10000 {
-            panic_with_error!(&env, PoolError::InvalidAmount);
+            panic_with_error!(&env, PoolError::InvalidUtilizationCap);
         }
         let old_cap_bps = Self::totals(&env).max_utilization_bps;
         env.storage()
@@ -2183,8 +2212,9 @@ impl PoolContract {
     /// # Panics
     /// * `NotInitialized` if the pool is not initialized.
     /// * `FeeTooHigh` if `fee_bps` exceeds `MAX_PROTOCOL_FEE_BPS` (2000 bps).
-    /// * `InvalidConfiguration` if `treasury` is the pool, invoice, escrow,
-    ///   registry, or funding-asset address.
+    /// * `InvalidTreasury` if `treasury` is the pool, invoice, escrow,
+    ///   registry, or funding-asset address. Validation runs before either
+    ///   stored value is changed.
     ///
     /// # Returns
     /// * `bool` - `true` when the fee is updated.
@@ -2232,6 +2262,36 @@ impl PoolContract {
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0u32)
+    }
+
+    /// Returns configuration schema version 1 in one call.
+    ///
+    /// Permissionless and available while paused; rejects uninitialized pools.
+    /// Existing getters and stored keys are unchanged. Settlement uses
+    /// `protocol_fee_bps`; `initialization_fee_bps` exposes the legacy fee key.
+    pub fn get_config_v1(env: Env) -> PoolConfigV1 {
+        Self::require_initialized(&env);
+        let invoice_contract = Self::invoice_contract(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let escrow_contract = Self::escrow_contract(&env)
+            .unwrap_or_else(|| panic_with_error!(&env, PoolError::NotInitialized));
+        let config = PoolConfigV1 {
+            version: 1,
+            funding_asset: Self::funding_asset(&env),
+            min_initial_deposit: Self::min_initial_deposit(&env),
+            max_utilization_bps: Self::totals(&env).max_utilization_bps,
+            max_batch_size: MAX_BATCH_SIZE,
+            max_protocol_fee_bps: MAX_PROTOCOL_FEE_BPS,
+            protocol_fee_bps: Self::get_protocol_fee_bps(env.clone()),
+            initialization_fee_bps: Self::fee_bps(&env).unwrap_or(0),
+            treasury: Self::get_treasury(env.clone()),
+            invoice_contract,
+            escrow_contract,
+            registry_contract: Self::registry_contract(&env),
+            paused: clearledger_pause::is_paused(&env),
+        };
+        Self::extend_instance_ttl(&env);
+        config
     }
 
     /// Returns the configured treasury address.
@@ -2291,7 +2351,7 @@ impl PoolContract {
             || treasury == funding_asset
             || treasury == registry_contract
         {
-            panic_with_error!(env, PoolError::InvalidConfiguration);
+            panic_with_error!(env, PoolError::InvalidTreasury);
         }
     }
 
@@ -2509,7 +2569,7 @@ impl PoolContract {
                 usdc.transfer(
                     &env.current_contract_address(),
                     &treasury,
-                    &(protocol_cut as i128),
+                    &Self::token_amount(env, protocol_cut),
                 );
             }
         }
@@ -2548,6 +2608,23 @@ impl PoolContract {
         env.storage()
             .instance()
             .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Converts a pool `u128` amount into the `i128` expected by the SEP-41
+    /// funding-asset `transfer` interface.
+    ///
+    /// `as i128` is a truncating cast: values above `i128::MAX` become
+    /// negative, which a non-conforming token could interpret as a credit
+    /// instead of a debit. The pool rejects them with the typed
+    /// `PoolError::Overflow` before any token call or state write.
+    ///
+    /// Trust boundary: the configured funding asset is assumed to be a SAC
+    /// that honours SEP-41 transfer semantics. The pool does not read
+    /// `balance()` to verify transfers, and a token that reports malformed
+    /// balances cannot influence accounting because those responses are never
+    /// consumed.
+    fn token_amount(env: &Env, amount: u128) -> i128 {
+        i128::try_from(amount).unwrap_or_else(|_| panic_with_error!(env, PoolError::Overflow))
     }
 
     /// Internal helper to mint LP shares (scoped for SEP-41 share issuance).

@@ -64,7 +64,6 @@ pub struct LPPosition {
     pub deposit_count: u32,
 }
 
-
 /// Eligibility or capacity reason reported by [`FundingPreview`].
 ///
 /// The variants mirror the first check `fund_invoice` would fail, so a caller
@@ -208,4 +207,24 @@ pub enum DataKey {
     /// `docs/SEP41_DESIGN.md` requires shares to carry the funding asset's
     /// decimals, and under the factory model each instance has its own.
     ShareDecimals,
+}
+
+/// Versioned read-only pool configuration. Existing scalar getters remain available.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PoolConfigV1 {
+    pub version: u32,
+    pub funding_asset: Address,
+    pub min_initial_deposit: u128,
+    pub max_utilization_bps: u32,
+    pub max_batch_size: u32,
+    pub max_protocol_fee_bps: u32,
+    /// Effective settlement fee, distinct from the legacy initializer fee key.
+    pub protocol_fee_bps: u32,
+    pub initialization_fee_bps: u32,
+    pub treasury: Address,
+    pub invoice_contract: Address,
+    pub escrow_contract: Address,
+    pub registry_contract: Address,
+    pub paused: bool,
 }

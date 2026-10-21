@@ -49,4 +49,11 @@ pub enum InvoiceError {
     /// Expiry is time-based, so it takes effect even if `expire_listing` has
     /// not been called yet in this ledger.
     ListingExpired = 32,
+    // Codes 29-30 are reserved; 31 is NotFunded; 32 is used by listing expiry.
+    /// A wiring setter (or `initialize`) was given an address that aliases
+    /// `admin`, this contract, or another already-configured contract role.
+    InvalidContractAddress = 33,
+    /// `add_supported_asset` was given an address that aliases `admin`, this
+    /// contract, or one of the wired contract roles instead of a token.
+    InvalidAsset = 34,
 }

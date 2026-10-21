@@ -187,8 +187,9 @@ deployed instance chooses its admin.
 | `list_profiles_page` | Registry | Read-only view |
 | All `get_*`, `get_by_*`, `get_counts`, `balance`, `total_supply`, `allowance`, `get_attestation` | Invoice, Pool, Escrow | Read-only |
 | `get_stats`, `get_lp_position`, `get_utilization_rate`, `get_usdc_asset` | Pool | Read-only views |
-| `get_locked`, `get_locked_at`, `get_history` | Escrow | Read-only views |
+| `get_locked`, `get_locked_at`, `get_history`, `get_history_page` | Escrow | Read-only views; retained history is bounded and paginated |
 | `get_funded_amount`, `get_expiry_window` | Invoice | Read-only views |
+| `expire_listing` | Invoice | Also callable by issuer (Pattern A) |
 | `get_pool_for_asset`, `get_aggregate_stats`, `list_assets` | Pool factory | Read-only |
 
 Read-only views remain callable while a contract is paused.
@@ -370,6 +371,10 @@ escrow upgrade (locked funds) and invoice upgrade/rewiring (repayment flows).
 - Registry/invoice/pool ownership transfer needs the new admin too, so a
   stolen key cannot unilaterally hand ownership to an attacker without that
   new key signing. Registry's `transfer_admin` is an explicit exception.
+- On the pool factory the admin is the asset-registration trust boundary: it is
+  copied into every newly deployed pool as that pool's admin and treasury. A
+  factory ownership transfer therefore needs both signatures, and once it lands
+  the old key can no longer register assets or move ownership again.
 - Pool funding is permissionless, so compromising the pool admin does **not**
   let the attacker choose which invoices receive capital; they can only pause,
   change parameters, or transfer ownership.
@@ -416,6 +421,32 @@ hostile address.
 `Funded`/`Active`/`Confirmed` and a passed due date. A `FundedInvoice` entry
 prevents double-funding, and escrow rejects an existing lock with
 `AlreadyLocked`.
+
+#### Attestation replay and domain separation
+
+`submit_attestation` is permissionless, so the signed payload is the entire
+trust boundary. The signed preimage is the XDR `AttestationPayload`
+(`domain_separator`, `invoice_id`, `risk_score`, `evidence_hash`, `agent_id`,
+`nonce`), hashed with keccak256 and signed with secp256k1. Verification
+requires:
+
+- the effective domain separator
+  `SHA-256(tag || ledger.network_id() || contract_address.to_xdr())`, which
+  binds the scheme, the Stellar network passphrase hash, and this exact
+  invoice-contract deployment;
+- the payload's `invoice_id` to equal the submitted invoice id;
+- the recovered pubkey to equal the active agent's registered pubkey for the
+  payload's `agent_id`; and
+- no attestation to be stored yet for that invoice.
+
+Consequences: a signature cannot be moved to another invoice, another
+network, another invoice-contract deployment, another nonce, or another agent
+identity. Changing any signed field invalidates the signature, and the
+one-attestation-per-invoice storage check blocks byte-for-byte replay. The
+nonce is signed but is **not** a per-agent replay ledger; distinct nonces do
+not permit a second attestation for the same invoice. The full wire format,
+migration note, and resource profile are in
+[ATTESTATIONS.md](./ATTESTATIONS.md).
 
 ### 5. Integer Over/Underflow
 
@@ -476,6 +507,38 @@ escrow code while paused and change all invariants.
 
 **Mitigation:** None on-chain beyond the requirement that the admin key signs.
 These are documented centralization risks, not solved problems.
+
+### 9. Hostile or Non-Conforming Funding Asset
+
+**Risk:** A pool's configured funding asset is an external SAC contract. If
+its `transfer` fails, or if a caller supplies an amount outside the token's
+signed `i128` range, a careless pool could commit accounting before the token
+call, mint shares without receiving funds, or hand the token a negative amount
+through a truncating `as i128` cast.
+
+**Mitigation:**
+- `deposit` calls the funding asset's `transfer` before writing shares or
+  totals. A failed SAC call reverts the whole invocation, so no shares are
+  minted and no accounting changes survive.
+- `fund_invoice` writes pool state before its cross-contract calls
+  (checks-effects-interactions), but a failed `escrow::lock` transfer reverts
+  the entire invocation together with the `FundedInvoice` entry, counters, and
+  invoice status. A failed attempt can be retried; a successful one is still
+  protected by the `AlreadyFunded` replay guard.
+- Every amount passed to a funding-asset `transfer` is checked against
+  `i128::MAX` first and rejected with `PoolError::Overflow` rather than being
+  truncated to a negative value.
+- The pool never reads the funding asset's `balance()`. Accounting is derived
+  from the token transfer's success and the pool's own totals, so a malformed
+  or lying `balance()` response cannot influence shares, deposits, or funded
+  state.
+
+**Trust boundary:** The configured funding asset is assumed to implement SAC /
+SEP-41 semantics and to move exactly the requested amount when `transfer`
+returns successfully. A token that returns success without moving funds is
+outside the pool's ability to detect; the pool deliberately does not add a
+post-transfer balance check because that would introduce a new untrusted
+read on the hot path.
 
 ---
 

@@ -29,4 +29,11 @@ pub enum PoolFactoryError {
     InvalidLimit = 14,
     /// `get_assets_page` was given a cursor past the end of the asset index.
     InvalidCursor = 15,
+    /// The asset passed to a registration entry point aliases the factory
+    /// admin, the factory itself, or a wired pool/contract address instead of
+    /// a distinct token contract.
+    InvalidAsset = 16,
+    /// A registration entry point was given an invoice, escrow, or pool
+    /// address that aliases another configured role.
+    InvalidContractAddress = 17,
 }
